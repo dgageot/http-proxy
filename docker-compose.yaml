@@ -10,6 +10,14 @@ services:
     links:
       - firewall:example.com
 
+  mcp-tool-good-ignore-env-proxy:
+    image: alpine/curl
+    command: curl -fsSL https://example.com -o /dev/null
+    depends_on:
+      - firewall
+    links:
+      - firewall:example.com
+
   mcp-tool-bad:
     image: alpine/curl
     command: curl -fsSL https://google.com -o /dev/null
@@ -21,6 +29,14 @@ services:
     links:
       - firewall:example.com
   
+  mcp-tool-bad-ignore-env-proxy:
+    image: alpine/curl
+    command: curl -fsSL https://google.com -o /dev/null
+    depends_on:
+      - firewall
+    links:
+      - firewall:example.com
+
   firewall:
     build:
       context: .
