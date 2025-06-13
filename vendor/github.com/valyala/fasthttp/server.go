@@ -148,6 +148,18 @@ type ServeHandler func(c net.Conn) error
 type Server struct {
 	noCopy noCopy
 
+	perIPConnCounter perIPConnCounter
+
+	ctxPool        sync.Pool
+	readerPool     sync.Pool
+	writerPool     sync.Pool
+	hijackConnPool sync.Pool
+
+	// Logger, which is used by RequestCtx.Logger().
+	//
+	// By default standard logger from log package is used.
+	Logger Logger
+
 	// Handler for processing incoming requests.
 	//
 	// Take into account that no `panic` recovery is done by `fasthttp` (thus any `panic` will take down the entire server).
@@ -181,10 +193,42 @@ type Server struct {
 	// like they are normal requests.
 	ContinueHandler func(header *RequestHeader) bool
 
+	// ConnState specifies an optional callback function that is
+	// called when a client connection changes state. See the
+	// ConnState type and associated constants for details.
+	ConnState func(net.Conn, ConnState)
+
+	// TLSConfig optionally provides a TLS configuration for use
+	// by ServeTLS, ServeTLSEmbed, ListenAndServeTLS, ListenAndServeTLSEmbed,
+	// AppendCert, AppendCertEmbed and NextProto.
+	//
+	// Note that this value is cloned by ServeTLS, ServeTLSEmbed, ListenAndServeTLS
+	// and ListenAndServeTLSEmbed, so it's not possible to modify the configuration
+	// with methods like tls.Config.SetSessionTicketKeys.
+	// To use SetSessionTicketKeys, use Server.Serve with a TLS Listener
+	// instead.
+	TLSConfig *tls.Config
+
+	// FormValueFunc, which is used by RequestCtx.FormValue and support for customizing
+	// the behaviour of the RequestCtx.FormValue function.
+	//
+	// NetHttpFormValueFunc gives a FormValueFunc func implementation that is consistent with net/http.
+	FormValueFunc FormValueFunc
+
+	nextProtos map[string]ServeHandler
+
+	concurrencyCh chan struct{}
+
+	idleConns map[net.Conn]*atomic.Int64
+	done      chan struct{}
+
 	// Server name for sending in response headers.
 	//
 	// Default server name is used if left blank.
 	Name string
+
+	// We need to know our listeners and idle connections so we can close them in Shutdown().
+	ln []net.Listener
 
 	// The maximum number of concurrent connections the server may serve.
 	//
@@ -261,6 +305,21 @@ type Server struct {
 	//
 	// Request body size is limited by DefaultMaxRequestBodySize by default.
 	MaxRequestBodySize int
+
+	// SleepWhenConcurrencyLimitsExceeded is a duration to be slept of if
+	// the concurrency limit in exceeded (default [when is 0]: don't sleep
+	// and accept new connections immediately).
+	SleepWhenConcurrencyLimitsExceeded time.Duration
+
+	idleConnsMu sync.Mutex
+
+	mu sync.Mutex
+
+	concurrency uint32
+	open        int32
+	stop        int32
+
+	rejectedRequestsCount uint32
 
 	// Whether to disable keep-alive connections.
 	//
@@ -340,11 +399,6 @@ type Server struct {
 	//     * cONTENT-lenGTH -> Content-Length
 	DisableHeaderNamesNormalizing bool
 
-	// SleepWhenConcurrencyLimitsExceeded is a duration to be slept of if
-	// the concurrency limit in exceeded (default [when is 0]: don't sleep
-	// and accept new connections immediately).
-	SleepWhenConcurrencyLimitsExceeded time.Duration
-
 	// NoDefaultServerHeader, when set to true, causes the default Server header
 	// to be excluded from the Response.
 	//
@@ -382,57 +436,6 @@ type Server struct {
 	// and calls the handler sooner when given body is
 	// larger than the current limit.
 	StreamRequestBody bool
-
-	// ConnState specifies an optional callback function that is
-	// called when a client connection changes state. See the
-	// ConnState type and associated constants for details.
-	ConnState func(net.Conn, ConnState)
-
-	// Logger, which is used by RequestCtx.Logger().
-	//
-	// By default standard logger from log package is used.
-	Logger Logger
-
-	// TLSConfig optionally provides a TLS configuration for use
-	// by ServeTLS, ServeTLSEmbed, ListenAndServeTLS, ListenAndServeTLSEmbed,
-	// AppendCert, AppendCertEmbed and NextProto.
-	//
-	// Note that this value is cloned by ServeTLS, ServeTLSEmbed, ListenAndServeTLS
-	// and ListenAndServeTLSEmbed, so it's not possible to modify the configuration
-	// with methods like tls.Config.SetSessionTicketKeys.
-	// To use SetSessionTicketKeys, use Server.Serve with a TLS Listener
-	// instead.
-	TLSConfig *tls.Config
-
-	// FormValueFunc, which is used by RequestCtx.FormValue and support for customizing
-	// the behaviour of the RequestCtx.FormValue function.
-	//
-	// NetHttpFormValueFunc gives a FormValueFunc func implementation that is consistent with net/http.
-	FormValueFunc FormValueFunc
-
-	nextProtos map[string]ServeHandler
-
-	concurrency      uint32
-	concurrencyCh    chan struct{}
-	perIPConnCounter perIPConnCounter
-
-	ctxPool        sync.Pool
-	readerPool     sync.Pool
-	writerPool     sync.Pool
-	hijackConnPool sync.Pool
-
-	// We need to know our listeners and idle connections so we can close them in Shutdown().
-	ln []net.Listener
-
-	idleConns   map[net.Conn]time.Time
-	idleConnsMu sync.Mutex
-
-	mu   sync.Mutex
-	open int32
-	stop int32
-	done chan struct{}
-
-	rejectedRequestsCount uint32
 }
 
 // TimeoutHandler creates RequestHandler, which returns StatusRequestTimeout
@@ -585,37 +588,103 @@ func CompressHandlerBrotliLevel(h RequestHandler, brotliLevel, otherLevel int) R
 type RequestCtx struct {
 	noCopy noCopy
 
-	// Incoming request.
-	//
-	// Copying Request by value is forbidden. Use pointer to Request instead.
-	Request Request
-
 	// Outgoing response.
 	//
 	// Copying Response by value is forbidden. Use pointer to Response instead.
 	Response Response
 
-	userValues userData
-
-	connID         uint64
-	connRequestNum uint64
-	connTime       time.Time
-	remoteAddr     net.Addr
+	connTime time.Time
 
 	time time.Time
 
-	logger ctxLogger
-	s      *Server
-	c      net.Conn
-	fbr    firstByteReader
+	logger     ctxLogger
+	remoteAddr net.Addr
+
+	c net.Conn
+	s *Server
 
 	timeoutResponse *Response
 	timeoutCh       chan struct{}
 	timeoutTimer    *time.Timer
 
-	hijackHandler    HijackHandler
+	hijackHandler HijackHandler
+	formValueFunc FormValueFunc
+	fbr           firstByteReader
+
+	// Incoming request.
+	//
+	// Copying Request by value is forbidden. Use pointer to Request instead.
+	Request Request
+
+	connID           uint64
+	connRequestNum   uint64
 	hijackNoResponse bool
-	formValueFunc    FormValueFunc
+}
+
+// EarlyHints allows the server to hint to the browser what resources a page would need
+// so the browser can preload them while waiting for the server's full response. Only Link
+// headers already written to the response will be transmitted as Early Hints.
+//
+// This is a HTTP/2+ feature but all browsers will either understand it or safely ignore it.
+//
+// NOTE: Older HTTP/1.1 non-browser clients may face compatibility issues.
+//
+// See: https://developer.chrome.com/docs/web-platform/early-hints and
+// https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Link#syntax
+//
+// Example:
+//
+//	func(ctx *fasthttp.RequestCtx) {
+//	   ctx.Response.Header.Add("Link", "<https://fonts.google.com>; rel=preconnect")
+//	   ctx.EarlyHints()
+//	   time.Sleep(5*time.Second) // some time-consuming task
+//	   ctx.SetStatusCode(fasthttp.StatusOK)
+//	   ctx.SetBody([]byte("<html><head></head><body><h1>Hello from Fasthttp</h1></body></html>"))
+//	}
+func (ctx *RequestCtx) EarlyHints() error {
+	links := ctx.Response.Header.PeekAll(b2s(strLink))
+	if len(links) > 0 {
+		c := acquireWriter(ctx)
+		defer releaseWriter(ctx.s, c)
+		_, err := c.Write(strEarlyHints)
+		if err != nil {
+			return err
+		}
+		for _, l := range links {
+			if len(l) == 0 {
+				continue
+			}
+			_, err = c.Write(strLink)
+			if err != nil {
+				return err
+			}
+			_, err = c.Write(strColon)
+			if err != nil {
+				return err
+			}
+			_, err = c.Write(strSpace)
+			if err != nil {
+				return err
+			}
+			_, err = c.Write(l)
+			if err != nil {
+				return err
+			}
+			_, err = c.Write(strCRLF)
+			if err != nil {
+				return err
+			}
+		}
+		_, err = c.Write(strCRLF)
+		if err != nil {
+			return err
+		}
+		err = c.Flush()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // HijackHandler must process the hijacked connection c.
@@ -672,42 +741,42 @@ func (ctx *RequestCtx) Hijacked() bool {
 }
 
 // SetUserValue stores the given value (arbitrary object)
-// under the given key in ctx.
+// under the given key in Request.
 //
-// The value stored in ctx may be obtained by UserValue*.
+// The value stored in Request may be obtained by UserValue*.
 //
 // This functionality may be useful for passing arbitrary values between
 // functions involved in request processing.
 //
-// All the values are removed from ctx after returning from the top
+// All the values are removed from Request after returning from the top
 // RequestHandler. Additionally, Close method is called on each value
-// implementing io.Closer before removing the value from ctx.
+// implementing io.Closer before removing the value from Request.
 func (ctx *RequestCtx) SetUserValue(key, value any) {
-	ctx.userValues.Set(key, value)
+	ctx.Request.SetUserValue(key, value)
 }
 
 // SetUserValueBytes stores the given value (arbitrary object)
-// under the given key in ctx.
+// under the given key in Request.
 //
-// The value stored in ctx may be obtained by UserValue*.
+// The value stored in Request may be obtained by UserValue*.
 //
 // This functionality may be useful for passing arbitrary values between
 // functions involved in request processing.
 //
-// All the values stored in ctx are deleted after returning from RequestHandler.
+// All the values stored in Request are deleted after returning from RequestHandler.
 func (ctx *RequestCtx) SetUserValueBytes(key []byte, value any) {
-	ctx.userValues.SetBytes(key, value)
+	ctx.Request.SetUserValueBytes(key, value)
 }
 
 // UserValue returns the value stored via SetUserValue* under the given key.
 func (ctx *RequestCtx) UserValue(key any) any {
-	return ctx.userValues.Get(key)
+	return ctx.Request.UserValue(key)
 }
 
 // UserValueBytes returns the value stored via SetUserValue*
 // under the given key.
 func (ctx *RequestCtx) UserValueBytes(key []byte) any {
-	return ctx.userValues.GetBytes(key)
+	return ctx.Request.UserValueBytes(key)
 }
 
 // VisitUserValues calls visitor for each existing userValue with a key that is a string or []byte.
@@ -715,12 +784,7 @@ func (ctx *RequestCtx) UserValueBytes(key []byte) any {
 // visitor must not retain references to key and value after returning.
 // Make key and/or value copies if you need storing them after returning.
 func (ctx *RequestCtx) VisitUserValues(visitor func([]byte, any)) {
-	for i, n := 0, len(ctx.userValues); i < n; i++ {
-		kv := &ctx.userValues[i]
-		if _, ok := kv.key.(string); ok {
-			visitor(s2b(kv.key.(string)), kv.value)
-		}
-	}
+	ctx.Request.VisitUserValues(visitor)
 }
 
 // VisitUserValuesAll calls visitor for each existing userValue.
@@ -728,25 +792,22 @@ func (ctx *RequestCtx) VisitUserValues(visitor func([]byte, any)) {
 // visitor must not retain references to key and value after returning.
 // Make key and/or value copies if you need storing them after returning.
 func (ctx *RequestCtx) VisitUserValuesAll(visitor func(any, any)) {
-	for i, n := 0, len(ctx.userValues); i < n; i++ {
-		kv := &ctx.userValues[i]
-		visitor(kv.key, kv.value)
-	}
+	ctx.Request.VisitUserValuesAll(visitor)
 }
 
-// ResetUserValues allows to reset user values from Request Context.
+// ResetUserValues allows to reset user values from Request.
 func (ctx *RequestCtx) ResetUserValues() {
-	ctx.userValues.Reset()
+	ctx.Request.ResetUserValues()
 }
 
-// RemoveUserValue removes the given key and the value under it in ctx.
+// RemoveUserValue removes the given key and the value under it in Request.
 func (ctx *RequestCtx) RemoveUserValue(key any) {
-	ctx.userValues.Remove(key)
+	ctx.Request.RemoveUserValue(key)
 }
 
-// RemoveUserValueBytes removes the given key and the value under it in ctx.
+// RemoveUserValueBytes removes the given key and the value under it in Request.
 func (ctx *RequestCtx) RemoveUserValueBytes(key []byte) {
-	ctx.userValues.RemoveBytes(key)
+	ctx.Request.RemoveUserValueBytes(key)
 }
 
 type connTLSer interface {
@@ -802,7 +863,6 @@ func (ctx *RequestCtx) Conn() net.Conn {
 }
 
 func (ctx *RequestCtx) reset() {
-	ctx.userValues.Reset()
 	ctx.Request.Reset()
 	ctx.Response.Reset()
 	ctx.fbr.reset()
@@ -1152,7 +1212,7 @@ var (
 	// NetHttpFormValueFunc gives consistent behavior with net/http.
 	// POST and PUT body parameters take precedence over URL query string values.
 	//
-	//nolint:stylecheck // backwards compatibility
+	//nolint:staticcheck // backwards compatibility
 	NetHttpFormValueFunc = func(ctx *RequestCtx, key string) []byte {
 		v := ctx.PostArgs().Peek(key)
 		if len(v) > 0 {
@@ -1592,14 +1652,14 @@ func (s *Server) NextProto(key string, nph ServeHandler) {
 func (s *Server) getNextProto(c net.Conn) (proto string, err error) {
 	if tlsConn, ok := c.(connTLSer); ok {
 		if s.ReadTimeout > 0 {
-			if err := c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
-				panic(fmt.Sprintf("BUG: error in SetReadDeadline(%v): %v", s.ReadTimeout, err))
+			if err = c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
+				return
 			}
 		}
 
 		if s.WriteTimeout > 0 {
-			if err := c.SetWriteDeadline(time.Now().Add(s.WriteTimeout)); err != nil {
-				panic(fmt.Sprintf("BUG: error in SetWriteDeadline(%v): %v", s.WriteTimeout, err))
+			if err = c.SetWriteDeadline(time.Now().Add(s.WriteTimeout)); err != nil {
+				return
 			}
 		}
 
@@ -1699,10 +1759,6 @@ func (s *Server) ServeTLS(ln net.Listener, certFile, keyFile string) error {
 		}
 	}
 
-	// BuildNameToCertificate has been deprecated since 1.14.
-	// But since we also support older versions we'll keep this here.
-	s.TLSConfig.BuildNameToCertificate() //nolint:staticcheck
-
 	s.mu.Unlock()
 
 	return s.Serve(
@@ -1726,10 +1782,6 @@ func (s *Server) ServeTLSEmbed(ln net.Listener, certData, keyData []byte) error 
 			return err
 		}
 	}
-
-	// BuildNameToCertificate has been deprecated since 1.14.
-	// But since we also support older versions we'll keep this here.
-	s.TLSConfig.BuildNameToCertificate() //nolint:staticcheck
 
 	s.mu.Unlock()
 
@@ -1882,6 +1934,8 @@ func (s *Server) Shutdown() error {
 //
 // ShutdownWithContext does not close keepalive connections so it's recommended to set ReadTimeout and IdleTimeout
 // to something else than 0.
+//
+// When ShutdownWithContext returns errors, any operation to the Server is unavailable.
 func (s *Server) ShutdownWithContext(ctx context.Context) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1893,11 +1947,7 @@ func (s *Server) ShutdownWithContext(ctx context.Context) (err error) {
 		return nil
 	}
 
-	for _, ln := range s.ln {
-		if err = ln.Close(); err != nil {
-			return err
-		}
-	}
+	lnerr := s.closeListenersLocked()
 
 	if s.done != nil {
 		close(s.done)
@@ -1908,28 +1958,31 @@ func (s *Server) ShutdownWithContext(ctx context.Context) (err error) {
 	// Now we just have to wait until all workers are done or timeout.
 	ticker := time.NewTicker(time.Millisecond * 100)
 	defer ticker.Stop()
-END:
+
 	for {
 		s.closeIdleConns()
 
 		if open := atomic.LoadInt32(&s.open); open == 0 {
-			break
+			// There may be a pending request to call ctx.Done(). Therefore, we only set it to nil when open == 0.
+			s.done = nil
+			return lnerr
 		}
 		// This is not an optimal solution but using a sync.WaitGroup
 		// here causes data races as it's hard to prevent Add() to be called
 		// while Wait() is waiting.
 		select {
 		case <-ctx.Done():
-			err = ctx.Err()
-			break END
+			return ctx.Err()
 		case <-ticker.C:
 			continue
 		}
 	}
+}
 
-	s.done = nil
-	s.ln = nil
-	return err
+type connKeepAliveer interface {
+	SetKeepAlive(keepalive bool) error
+	SetKeepAlivePeriod(d time.Duration) error
+	io.Closer
 }
 
 func acceptConn(s *Server, ln net.Listener, lastPerIPErrorTime *time.Time) (net.Conn, error) {
@@ -1948,7 +2001,7 @@ func acceptConn(s *Server, ln net.Listener, lastPerIPErrorTime *time.Time) (net.
 			return nil, io.EOF
 		}
 
-		if tc, ok := c.(*net.TCPConn); ok && s.TCPKeepalive {
+		if tc, ok := c.(connKeepAliveer); ok && s.TCPKeepalive {
 			if err := tc.SetKeepAlive(s.TCPKeepalive); err != nil {
 				_ = tc.Close()
 				return nil, err
@@ -2029,8 +2082,8 @@ func (s *Server) ServeConn(c net.Conn) error {
 		c = pic
 	}
 
-	n := atomic.AddUint32(&s.concurrency, 1)
-	if n > uint32(s.getConcurrency()) {
+	n := int(atomic.AddUint32(&s.concurrency, 1)) // #nosec G115
+	if n > s.getConcurrency() {
 		atomic.AddUint32(&s.concurrency, ^uint32(0))
 		s.writeFastError(c, StatusServiceUnavailable, "The connection cannot be served because Server.Concurrency limit exceeded")
 		c.Close()
@@ -2132,13 +2185,33 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 		// Remove read or write deadlines that might have previously been set.
 		// The next handler is responsible for setting its own deadlines.
 		if s.ReadTimeout > 0 || s.WriteTimeout > 0 {
-			if err := c.SetDeadline(zeroTime); err != nil {
-				panic(fmt.Sprintf("BUG: error in SetDeadline(zeroTime): %v", err))
+			if err = c.SetDeadline(zeroTime); err != nil {
+				return
 			}
 		}
 
 		return handler(c)
 	}
+
+	s.idleConnsMu.Lock()
+	if s.idleConns == nil {
+		s.idleConns = make(map[net.Conn]*atomic.Int64)
+	}
+	idleConnTime, ok := s.idleConns[c]
+	if !ok {
+		v := idleConnTimePool.Get()
+		if v == nil {
+			v = &atomic.Int64{}
+		}
+		idleConnTime = v.(*atomic.Int64)
+		s.idleConns[c] = idleConnTime
+	}
+
+	// Count the connection as Idle after 5 seconds.
+	// Same as net/http.Server:
+	// https://github.com/golang/go/blob/85d7bab91d9a3ed1f76842e4328973ea75efef54/src/net/http/server.go#L2834-L2836
+	idleConnTime.Store(time.Now().Add(time.Second * 5).Unix())
+	s.idleConnsMu.Unlock()
 
 	serverName := s.getServerName()
 	connRequestNum := uint64(0)
@@ -2172,7 +2245,7 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 		// If this is a keep-alive connection set the idle timeout.
 		if connRequestNum > 1 {
 			if d := s.idleTimeout(); d > 0 {
-				if err := c.SetReadDeadline(time.Now().Add(d)); err != nil {
+				if err = c.SetReadDeadline(time.Now().Add(d)); err != nil {
 					break
 				}
 			}
@@ -2192,7 +2265,7 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 					// If reading from a keep-alive connection returns nothing it means
 					// the connection was closed (either timeout or from the other side).
 					if err != io.EOF {
-						err = ErrNothingRead{err}
+						err = ErrNothingRead{error: err}
 					}
 				}
 			}
@@ -2215,14 +2288,16 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 		if err == nil {
 			s.setState(c, StateActive)
 
+			idleConnTime.Store(0)
+
 			if s.ReadTimeout > 0 {
-				if err := c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
+				if err = c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
 					break
 				}
 			} else if s.IdleTimeout > 0 && connRequestNum > 1 {
 				// If this was an idle connection and the server has an IdleTimeout but
 				// no ReadTimeout then we should remove the ReadTimeout.
-				if err := c.SetReadDeadline(zeroTime); err != nil {
+				if err = c.SetReadDeadline(zeroTime); err != nil {
 					break
 				}
 			}
@@ -2256,8 +2331,8 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 					reqConf := onHdrRecv(&ctx.Request.Header)
 					if reqConf.ReadTimeout > 0 {
 						deadline := time.Now().Add(reqConf.ReadTimeout)
-						if err := c.SetReadDeadline(deadline); err != nil {
-							panic(fmt.Sprintf("BUG: error in SetReadDeadline(%v): %v", deadline, err))
+						if err = c.SetReadDeadline(deadline); err != nil {
+							break
 						}
 					}
 					switch {
@@ -2281,8 +2356,9 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 					err = ctx.Request.readLimitBody(br, maxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
 				}
 			}
-
-			if (s.ReduceMemoryUsage && br.Buffered() == 0) || err != nil {
+			// When StreamRequestBody is set to true, we cannot safely release br.
+			// For example, when using chunked encoding, it's possible that br has only read the request headers.
+			if (!s.StreamRequestBody && s.ReduceMemoryUsage && br.Buffered() == 0) || err != nil {
 				releaseReader(s, br)
 				br = nil
 			}
@@ -2353,7 +2429,7 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 				} else {
 					err = ctx.Request.ContinueReadBody(br, maxRequestBodySize, !s.DisablePreParseMultipartForm)
 				}
-				if (s.ReduceMemoryUsage && br.Buffered() == 0) || err != nil {
+				if (!s.StreamRequestBody && s.ReduceMemoryUsage && br.Buffered() == 0) || err != nil {
 					releaseReader(s, br)
 					br = nil
 				}
@@ -2396,20 +2472,20 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 		ctx.hijackNoResponse = false
 
 		if writeTimeout > 0 {
-			if err := c.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
-				panic(fmt.Sprintf("BUG: error in SetWriteDeadline(%v): %v", writeTimeout, err))
+			if err = c.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+				break
 			}
 			previousWriteTimeout = writeTimeout
 		} else if previousWriteTimeout > 0 {
 			// We don't want a write timeout but we previously set one, remove it.
-			if err := c.SetWriteDeadline(zeroTime); err != nil {
-				panic(fmt.Sprintf("BUG: error in SetWriteDeadline(zeroTime): %v", err))
+			if err = c.SetWriteDeadline(zeroTime); err != nil {
+				break
 			}
 			previousWriteTimeout = 0
 		}
 
 		connectionClose = connectionClose ||
-			(s.MaxRequestsPerConn > 0 && connRequestNum >= uint64(s.MaxRequestsPerConn)) ||
+			(s.MaxRequestsPerConn > 0 && connRequestNum >= uint64(s.MaxRequestsPerConn)) || // #nosec G115
 			ctx.Response.Header.ConnectionClose() ||
 			(s.CloseOnShutdown && atomic.LoadInt32(&s.stop) == 1)
 		if connectionClose {
@@ -2484,7 +2560,6 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 		}
 
 		s.setState(c, StateIdle)
-		ctx.userValues.Reset()
 		ctx.Request.Reset()
 		ctx.Response.Reset()
 
@@ -2492,6 +2567,8 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 			err = nil
 			break
 		}
+
+		idleConnTime.Store(time.Now().Unix())
 	}
 
 	if br != nil {
@@ -2504,11 +2581,18 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 		s.releaseCtx(ctx)
 	}
 
+	s.idleConnsMu.Lock()
+	ic, ok := s.idleConns[c]
+	if ok {
+		idleConnTimePool.Put(ic)
+		delete(s.idleConns, c)
+	}
+	s.idleConnsMu.Unlock()
+
 	return
 }
 
 func (s *Server) setState(nc net.Conn, state ConnState) {
-	s.trackConn(nc, state)
 	if hook := s.ConnState; hook != nil {
 		hook(nc, state)
 	}
@@ -2757,7 +2841,7 @@ func (ctx *RequestCtx) Done() <-chan struct{} {
 // RequestCtx.s.done is only closed when the server is shutting down.
 func (ctx *RequestCtx) Err() error {
 	select {
-	case <-ctx.s.done:
+	case <-ctx.Done():
 		return context.Canceled
 	default:
 		return nil
@@ -2775,6 +2859,7 @@ func (ctx *RequestCtx) Value(key any) any {
 }
 
 var fakeServer = &Server{
+	done: make(chan struct{}),
 	// Initialize concurrencyCh for TimeoutHandler
 	concurrencyCh: make(chan struct{}, DefaultConcurrency),
 }
@@ -2884,39 +2969,31 @@ func (s *Server) writeErrorResponse(bw *bufio.Writer, ctx *RequestCtx, serverNam
 	return bw
 }
 
-func (s *Server) trackConn(c net.Conn, state ConnState) {
-	s.idleConnsMu.Lock()
-	switch state {
-	case StateIdle:
-		if s.idleConns == nil {
-			s.idleConns = make(map[net.Conn]time.Time)
-		}
-		s.idleConns[c] = time.Now()
-	case StateNew:
-		if s.idleConns == nil {
-			s.idleConns = make(map[net.Conn]time.Time)
-		}
-		// Count the connection as Idle after 5 seconds.
-		// Same as net/http.Server:
-		// https://github.com/golang/go/blob/85d7bab91d9a3ed1f76842e4328973ea75efef54/src/net/http/server.go#L2834-L2836
-		s.idleConns[c] = time.Now().Add(time.Second * 5)
+var idleConnTimePool sync.Pool
 
-	default:
-		delete(s.idleConns, c)
+func (s *Server) closeIdleConns() {
+	s.idleConnsMu.Lock()
+	now := time.Now().Unix()
+	for c, ict := range s.idleConns {
+		t := ict.Load()
+		if t != 0 && now-t >= 0 {
+			_ = c.Close()
+			delete(s.idleConns, c)
+			idleConnTimePool.Put(ict)
+		}
 	}
 	s.idleConnsMu.Unlock()
 }
 
-func (s *Server) closeIdleConns() {
-	s.idleConnsMu.Lock()
-	now := time.Now()
-	for c, t := range s.idleConns {
-		if now.Sub(t) >= 0 {
-			_ = c.Close()
-			delete(s.idleConns, c)
+func (s *Server) closeListenersLocked() error {
+	var err error
+	for _, ln := range s.ln {
+		if cerr := ln.Close(); cerr != nil && err == nil {
+			err = cerr
 		}
 	}
-	s.idleConnsMu.Unlock()
+	s.ln = nil
+	return err
 }
 
 // A ConnState represents the state of a client connection to a server.
@@ -2959,7 +3036,7 @@ const (
 	StateClosed
 )
 
-var stateName = map[ConnState]string{
+var stateName = []string{
 	StateNew:      "new",
 	StateActive:   "active",
 	StateIdle:     "idle",
