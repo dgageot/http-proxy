@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -19,6 +20,8 @@ func NewProxyServer(allowedHosts string) *ProxyServer {
 	for host := range strings.SplitSeq(allowedHosts, ",") {
 		allowed[strings.TrimSpace(host)] = true
 	}
+
+	fmt.Println("Allowed hosts:", allowed)
 
 	return &ProxyServer{
 		allowedHosts: allowed,
@@ -46,16 +49,16 @@ func (p *ProxyServer) Run(ctx context.Context, addr string) error {
 }
 
 func (p *ProxyServer) handleRequest(ctx *fasthttp.RequestCtx) {
+	if !p.allowedHosts[string(ctx.Host())] {
+		ctx.Response.SetStatusCode(http.StatusForbidden)
+		return
+	}
+
 	if string(ctx.Method()) == http.MethodConnect {
 		p.handleTunneling(ctx)
 		return
 	}
-
-	if p.allowedHosts[string(ctx.Host())] {
-		p.handleHTTP(ctx)
-	} else {
-		ctx.Response.SetStatusCode(http.StatusForbidden)
-	}
+	p.handleHTTP(ctx)
 }
 
 func (p *ProxyServer) handleTunneling(ctx *fasthttp.RequestCtx) {

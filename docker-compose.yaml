@@ -1,0 +1,37 @@
+services:
+  mcp-tool-good:
+    image: alpine/curl
+    command: curl -fsSL https://example.com -o /dev/null
+    environment:
+      http_proxy: firewall:8080
+      https_proxy: firewall:8080
+    depends_on:
+      - firewall
+    links:
+      - firewall:example.com
+
+  mcp-tool-bad:
+    image: alpine/curl
+    command: curl -fsSL https://google.com -o /dev/null
+    environment:
+      http_proxy: firewall:8080
+      https_proxy: firewall:8080
+    depends_on:
+      - firewall
+    links:
+      - firewall:example.com
+  
+  firewall:
+    build:
+      context: .
+    environment:
+      ALLOWED_HOSTS: example.com:443
+    networks:
+      - firewall
+      - default
+
+networks:
+  default:
+    internal: true
+
+  firewall: {}
