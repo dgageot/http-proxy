@@ -56,9 +56,9 @@ func (p *ProxyServer) handleRequest(ctx *fasthttp.RequestCtx) {
 
 	if string(ctx.Method()) == http.MethodConnect {
 		p.handleTunneling(ctx)
-		return
+	} else {
+		p.handleHTTP(ctx)
 	}
-	p.handleHTTP(ctx)
 }
 
 func (p *ProxyServer) handleTunneling(ctx *fasthttp.RequestCtx) {
@@ -69,7 +69,7 @@ func (p *ProxyServer) handleTunneling(ctx *fasthttp.RequestCtx) {
 	}
 
 	ctx.SetStatusCode(http.StatusOK)
-	ctx.Response.SetBodyRaw([]byte{})
+	ctx.Response.SetBodyRaw(nil)
 	ctx.Hijack(func(clientConn net.Conn) {
 		defer clientConn.Close()
 		defer destinationConn.Close()
