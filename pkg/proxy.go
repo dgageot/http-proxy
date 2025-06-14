@@ -28,12 +28,7 @@ func NewProxyServer(allowedHosts string) *ProxyServer {
 	}
 }
 
-func (p *ProxyServer) Run(ctx context.Context, addr string) error {
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp4", addr)
-	if err != nil {
-		return err
-	}
-
+func (p *ProxyServer) Run(ctx context.Context, ln net.Listener) error {
 	server := &fasthttp.Server{
 		Handler:            p.handleRequest,
 		MaxConnsPerIP:      10000,
