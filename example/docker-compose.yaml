@@ -31,7 +31,7 @@ services:
 
   firewall:
     build:
-      context: .
+      context: ..
     environment:
       ALLOWED_HOSTS: example.com:443
     networks:
