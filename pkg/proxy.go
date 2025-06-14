@@ -45,10 +45,12 @@ func (p *ProxyServer) Run(ctx context.Context, ln net.Listener) error {
 
 func (p *ProxyServer) handleRequest(ctx *fasthttp.RequestCtx) {
 	if !p.allowedHosts[string(ctx.Host())] {
+		fmt.Println("Connection DENIED to host:", string(ctx.Host()))
 		ctx.Response.SetStatusCode(http.StatusForbidden)
 		return
 	}
 
+	fmt.Println("Connection GRANTED to host:", string(ctx.Host()))
 	if string(ctx.Method()) == http.MethodConnect {
 		p.handleTunneling(ctx)
 	} else {
